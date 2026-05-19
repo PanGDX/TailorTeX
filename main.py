@@ -3,34 +3,48 @@ import threading
 from compiler import compile_latex_to_pdf  # Import your new module
 import datetime, os
 from pathlib import Path
+import pdf_renderer
 
 GEN_PDF_DIR = "generated-pdfs"
 LATEX_CODE_DIR = "latex-files"
+TEMP_PNG_DIR = ".temp"
 
 def get_filepath():
     now = datetime.datetime.now()
     filepath = f"{GEN_PDF_DIR}/{now.strftime('%Y-%m-%d %H-%M-%S')}"+".pdf"
     return filepath
 
+
 def compile_thread(latex_code):
-    # 1. Update GUI to show loading
     dpg.set_value("status_text", " Status: Compiling (Please wait...)")
     
-    # 2. Call our module
-    success, message = compile_latex_to_pdf(latex_code, output_pdf_path=get_filepath())
+    pdf_filepath = get_filepath()
+    success, message = compile_latex_to_pdf(latex_code, output_pdf_path=pdf_filepath)
     
-    # 3. Update GUI based on result
     if success:
-        dpg.set_value("status_text", " Status: Ready (Compile Success!)")
-        print(message)
+        dpg.set_value("status_text", " Status: Rendering PDF...")
+        
+        render_success, render_msg = pdf_renderer.render_pdf_to_texture(pdf_filepath)
+        
+        if render_success:
+            dpg.set_value("status_text", " Status: Ready (Compile Success!)")
+            dpg.configure_item("error_modal", show=False) 
+        else:
+            dpg.set_value("status_text", " Status: Render Failed!")
+            # Show error modal for rendering failure
+            print(render_msg) 
+            dpg.set_value("error_modal_text", render_msg)
+            dpg.configure_item("error_modal", show=True)
 
-        # TODO for Issue #3: Trigger PyMuPDF here to reload the "current_resume.pdf" to an image
     else:
+        print(message) 
+
         dpg.set_value("status_text", " Status: Compile Failed!")
         dpg.set_value("error_modal_text", message)
         dpg.configure_item("error_modal", show=True)
         # Pop up an error window or print to console so the user sees the LaTeX error
-        print(message) 
+
+        
 
 def callback_compile(sender, app_data):
     # Grab the current code from the DearPyGui text editor
@@ -53,11 +67,9 @@ def callback_ai_tailor(sender, app_data):
 # 2. Main GUI Setup
 # ==========================================
 def setup_gui():
-    path = Path(f"./{GEN_PDF_DIR}")
-    path.mkdir(parents=True, exist_ok=True)
-
-    path = Path(f"./{LATEX_CODE_DIR}")
-    path.mkdir(parents=True, exist_ok=True)
+    for dir in [GEN_PDF_DIR, LATEX_CODE_DIR, TEMP_PNG_DIR]:
+        path = Path(f"./{dir}")
+        path.mkdir(parents=True, exist_ok=True)
 
     dpg.create_context()
 
@@ -67,7 +79,7 @@ def setup_gui():
     # RGBA format: Light gray background
     texture_data = [0.9, 0.9, 0.9, 1.0] * (tex_width * tex_height) 
 
-    with dpg.texture_registry(show=False):
+    with dpg.texture_registry(show=False, tag="tex_registry"):
         dpg.add_dynamic_texture(width=tex_width, height=tex_height, 
                                 default_value=texture_data, tag="pdf_texture_tag")
 
@@ -109,11 +121,17 @@ def setup_gui():
                     )
 
                 # --- RIGHT PANE: PDF Viewer ---
+                # --- RIGHT PANE: PDF Viewer ---
                 with dpg.child_window(border=False):
-                    dpg.add_text("PDF Viewer", color=[150, 150, 150])
-                    # To allow scrolling if the PDF is larger than the window, 
-                    # we wrap the image in a child_window that allows scrolling.
-                    with dpg.child_window(horizontal_scrollbar=True, width=-1, height=-1):
+                    
+                    # Viewer Toolbar (Zooming)
+                    with dpg.group(horizontal=True):
+                        dpg.add_text("PDF Viewer", color=[150, 150, 150])
+                        dpg.add_button(label="🔍 Zoom In", callback=lambda: pdf_renderer.zoom_in(None, None))
+                        dpg.add_button(label="🔍 Zoom Out", callback=lambda: pdf_renderer.zoom_out(None, None))
+
+                    # The container that allows scrolling (added tag="pdf_viewer_container")
+                    with dpg.child_window(horizontal_scrollbar=True, width=-1, height=-1, tag="pdf_viewer_container"):
                         dpg.add_image("pdf_texture_tag", tag="pdf_image_viewer")
 
 

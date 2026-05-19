@@ -1,11 +1,42 @@
 import dearpygui.dearpygui as dpg
+import threading
+from compiler import compile_latex_to_pdf  # Import your new module
+import datetime, os
+from pathlib import Path
 
-# ==========================================
-# 1. Dummy Callbacks (To be implemented later)
-# ==========================================
+GEN_PDF_DIR = "generated-pdfs"
+LATEX_CODE_DIR = "latex-files"
+
+def get_filepath():
+    now = datetime.datetime.now()
+    filepath = f"{GEN_PDF_DIR}/{now.strftime('%Y-%m-%d %H-%M-%S')}"+".pdf"
+    return filepath
+
+def compile_thread(latex_code):
+    # 1. Update GUI to show loading
+    dpg.set_value("status_text", " Status: Compiling (Please wait...)")
+    
+    # 2. Call our module
+    success, message = compile_latex_to_pdf(latex_code, output_pdf_path=get_filepath())
+    
+    # 3. Update GUI based on result
+    if success:
+        dpg.set_value("status_text", " Status: Ready (Compile Success!)")
+        print(message)
+        
+        # TODO for Issue #3: Trigger PyMuPDF here to reload the "current_resume.pdf" to an image
+    else:
+        dpg.set_value("status_text", " Status: Compile Failed!")
+        # Pop up an error window or print to console so the user sees the LaTeX error
+        print(message) 
+
 def callback_compile(sender, app_data):
-    print("Action: Trigger Compilation Thread")
-    # Hint: We will implement Issue #2 (Threading/Compile) here
+    # Grab the current code from the DearPyGui text editor
+    current_code = dpg.get_value("editor_text")
+    
+    # Spin up a background thread so the GUI does not freeze
+    t = threading.Thread(target=compile_thread, args=(current_code,))
+    t.start()
 
 def callback_templates(sender, app_data):
     print("Action: Open Templates Modal")
@@ -20,6 +51,12 @@ def callback_ai_tailor(sender, app_data):
 # 2. Main GUI Setup
 # ==========================================
 def setup_gui():
+    path = Path(f"./{GEN_PDF_DIR}")
+    path.mkdir(parents=True, exist_ok=True)
+
+    path = Path(f"./{LATEX_CODE_DIR}")
+    path.mkdir(parents=True, exist_ok=True)
+
     dpg.create_context()
 
     # --- Setup Placeholder Texture for PDF ---

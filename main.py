@@ -23,10 +23,12 @@ def compile_thread(latex_code):
     if success:
         dpg.set_value("status_text", " Status: Ready (Compile Success!)")
         print(message)
-        
+
         # TODO for Issue #3: Trigger PyMuPDF here to reload the "current_resume.pdf" to an image
     else:
         dpg.set_value("status_text", " Status: Compile Failed!")
+        dpg.set_value("error_modal_text", message)
+        dpg.configure_item("error_modal", show=True)
         # Pop up an error window or print to console so the user sees the LaTeX error
         print(message) 
 
@@ -113,6 +115,19 @@ def setup_gui():
                     # we wrap the image in a child_window that allows scrolling.
                     with dpg.child_window(horizontal_scrollbar=True, width=-1, height=-1):
                         dpg.add_image("pdf_texture_tag", tag="pdf_image_viewer")
+
+
+    with dpg.window(label="Compilation Error", modal=True, show=False, tag="error_modal", 
+                    width=600, height=400, no_move=False):
+        
+        # We use a readonly multiline input_text instead of a standard text element.
+        # This allows the user to scroll through long LaTeX errors and copy/paste them to Google/AI!
+        dpg.add_input_text(multiline=True, readonly=True, tag="error_modal_text", 
+                           width=-1, height=-40)
+        
+        # A button to close the popup
+        dpg.add_button(label="Close", width=-1, 
+                       callback=lambda: dpg.configure_item("error_modal", show=False))
 
     # ==========================================
     # 3. Viewport and OS Window Execution

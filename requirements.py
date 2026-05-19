@@ -1,3 +1,2 @@
-dearpygui==2.3.1
-PyMuPDF==1.27.2.3
-numpy==2.4.2
+PyQt6==6.1.0.2
+PyQt6-WebEngine==6.10.1

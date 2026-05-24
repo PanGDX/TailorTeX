@@ -6,7 +6,8 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QPlainTextEdit, QSplitter, QDialog,
     QListWidget, QListWidgetItem, QMessageBox, QAbstractItemView,
-    QStackedWidget, QInputDialog
+    QStackedWidget, QInputDialog, QComboBox, QLineEdit, QFormLayout,
+    QGroupBox, QSizePolicy
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QFont
@@ -19,6 +20,14 @@ from snapshot_manager import save_snapshot, load_index as snap_load_index, \
     load_snapshot_content, delete_snapshot
 from template_manager import seed_default_templates, save_template, \
     load_index as tmpl_load_index, load_template_content, delete_template
+from ai_manager import (
+    load_api_key, save_api_key, load_provider, save_provider,
+    build_initial_messages, build_retry_messages,
+    request_latex, session_log_dir, AI_LOGS_DIR,
+)
+
+AI_PROVIDERS = ["OpenAI", "Claude", "Google Gemini"]
+MAX_AI_RETRIES = 3
 
 GEN_PDF_DIR = "generated-pdfs"
 LATEX_CODE_DIR = "latex-files"
@@ -374,6 +383,286 @@ class TemplatesDialog(QDialog):
 
 
 # ==========================================
+# Background Thread for AI Requests + Retry Loop
+# ==========================================
+class AIThread(QThread):
+    """
+    Runs the full AI request + compile-retry loop off the main thread.
+
+    Signals:
+        status_signal(str)           -- status bar text updates
+        finished_signal(bool, str, str, str)
+            success, result_latex_or_error, pdf_filepath, session_log_dir
+    """
+    status_signal    = pyqtSignal(str)
+    finished_signal  = pyqtSignal(bool, str, str, str)
+
+    def __init__(self, provider: str, api_key: str,
+                 latex: str, job_description: str,
+                 session_id: str, pdf_dir: str):
+        super().__init__()
+        self.provider        = provider
+        self.api_key         = api_key
+        self.latex           = latex
+        self.job_description = job_description
+        self.session_id      = session_id
+        self.pdf_dir         = pdf_dir
+
+    def run(self):
+        import tempfile, shutil, os
+
+        log_dir  = session_log_dir(self.session_id)
+        messages = build_initial_messages(self.latex, self.job_description)
+        last_latex   = ""
+        last_error   = ""
+
+        for attempt in range(1, MAX_AI_RETRIES + 1):
+            self.status_signal.emit(
+                f"Status: AI attempt {attempt}/{MAX_AI_RETRIES} — waiting for response…"
+            )
+
+            # ── Call the AI provider ───────────────────────────────────────
+            try:
+                new_latex, _raw = request_latex(
+                    provider=self.provider,
+                    api_key=self.api_key,
+                    messages=messages,
+                    session_id=self.session_id,
+                    attempt=attempt,
+                )
+            except Exception as exc:
+                self.finished_signal.emit(False, f"AI request failed: {exc}", "", log_dir)
+                return
+
+            last_latex = new_latex
+
+            # ── Try to compile ─────────────────────────────────────────────
+            self.status_signal.emit(
+                f"Status: AI attempt {attempt}/{MAX_AI_RETRIES} — compiling…"
+            )
+            pdf_path = os.path.join(
+                self.pdf_dir, f"ai_{self.session_id}_attempt{attempt}.pdf"
+            )
+            success, compile_msg = compile_latex_to_pdf(new_latex, pdf_path)
+
+            if success:
+                self.finished_signal.emit(True, new_latex, pdf_path, log_dir)
+                return
+
+            # ── Compile failed — prepare retry messages ────────────────────
+            last_error = compile_msg
+            if attempt < MAX_AI_RETRIES:
+                self.status_signal.emit(
+                    f"Status: Compile failed (attempt {attempt}), asking AI to fix…"
+                )
+                messages = build_retry_messages(messages, new_latex, compile_msg)
+
+        # All retries exhausted
+        err_msg = (
+            f"AI Error: LaTeX is not compiling after {MAX_AI_RETRIES} attempts.\n"
+            f"Previous runs saved at: {log_dir}\n\n"
+            f"Last compiler error:\n{last_error}"
+        )
+        self.finished_signal.emit(False, err_msg, "", log_dir)
+
+
+# ==========================================
+# AI Provider Settings Dialog
+# ==========================================
+class AISettingsDialog(QDialog):
+    """Small dialog to select the AI provider and enter / save the API key."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("AI Provider Settings")
+        self.setFixedWidth(420)
+        self.setModal(True)
+
+        layout = QVBoxLayout(self)
+
+        group = QGroupBox("API Configuration")
+        form  = QFormLayout(group)
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+
+        self.combo_provider = QComboBox()
+        self.combo_provider.addItems(AI_PROVIDERS)
+        self.combo_provider.currentTextChanged.connect(self._on_provider_changed)
+        form.addRow("Provider:", self.combo_provider)
+
+        self.edit_key = QLineEdit()
+        self.edit_key.setPlaceholderText("Paste your API key here")
+        self.edit_key.setEchoMode(QLineEdit.EchoMode.Password)
+        form.addRow("API Key:", self.edit_key)
+
+        lbl_note = QLabel(
+            "Keys are saved locally in .env in the project root.\n"
+            "They are never transmitted anywhere except the chosen provider."
+        )
+        lbl_note.setWordWrap(True)
+        lbl_note.setStyleSheet("color: gray; font-size: 11px;")
+        form.addRow(lbl_note)
+
+        layout.addWidget(group)
+
+        btn_row = QHBoxLayout()
+        btn_save   = QPushButton("Save")
+        btn_save.clicked.connect(self._on_save)
+        btn_cancel = QPushButton("Cancel")
+        btn_cancel.clicked.connect(self.reject)
+        btn_row.addStretch()
+        btn_row.addWidget(btn_save)
+        btn_row.addWidget(btn_cancel)
+        layout.addLayout(btn_row)
+
+        # Populate from .env
+        saved_provider = load_provider()
+        if saved_provider in AI_PROVIDERS:
+            self.combo_provider.setCurrentText(saved_provider)
+        self._on_provider_changed(self.combo_provider.currentText())
+
+    def _on_provider_changed(self, provider: str):
+        key = load_api_key(provider)
+        self.edit_key.setText(key)
+
+    def _on_save(self):
+        provider = self.combo_provider.currentText()
+        key      = self.edit_key.text().strip()
+        if not key:
+            QMessageBox.warning(self, "Missing Key", "Please enter an API key.")
+            return
+        save_provider(provider)
+        save_api_key(provider, key)
+        self.accept()
+
+    def selected_provider(self) -> str:
+        return self.combo_provider.currentText()
+
+
+# ==========================================
+# AI Tailor Dialog
+# ==========================================
+class AITailorDialog(QDialog):
+    """
+    Popup for pasting a job description and triggering the AI tailoring flow.
+    Emits latex_ready(str, str) with (new_latex, pdf_path) on success.
+    """
+    latex_ready = pyqtSignal(str, str)   # (new_latex, pdf_filepath)
+
+    def __init__(self, current_latex: str, provider: str, api_key: str,
+                 pdf_dir: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("AI Tailor — Job Description")
+        self.resize(660, 520)
+        self.setModal(True)
+
+        self._current_latex = current_latex
+        self._provider      = provider
+        self._api_key       = api_key
+        self._pdf_dir       = pdf_dir
+        self._ai_thread: AIThread | None = None
+
+        layout = QVBoxLayout(self)
+
+        # Provider badge
+        badge = QLabel(f"Provider: <b>{provider}</b>")
+        badge.setStyleSheet("color: gray; font-size: 12px;")
+        layout.addWidget(badge)
+
+        # Job description input
+        lbl = QLabel("Paste the job description below, then click <b>Apply AI</b>:")
+        lbl.setWordWrap(True)
+        layout.addWidget(lbl)
+
+        self.text_jd = QPlainTextEdit()
+        self.text_jd.setPlaceholderText(
+            "Job Description:\n\n"
+            "Company: \n"
+            "Role: \n"
+            "Key Requirements:\n"
+            "  - \n"
+            "  - \n"
+            "\nAbout the role:\n"
+        )
+        self.text_jd.setFont(QFont("Courier New", 10))
+        layout.addWidget(self.text_jd, stretch=1)
+
+        # Status label
+        self.lbl_status = QLabel("")
+        self.lbl_status.setStyleSheet("color: #555; font-size: 11px;")
+        self.lbl_status.setWordWrap(True)
+        layout.addWidget(self.lbl_status)
+
+        # Buttons
+        btn_row = QHBoxLayout()
+        self.btn_apply  = QPushButton("✨ Apply AI")
+        self.btn_apply.setDefault(True)
+        self.btn_apply.clicked.connect(self._on_apply_clicked)
+
+        self.btn_cancel = QPushButton("Cancel")
+        self.btn_cancel.clicked.connect(self._on_cancel_clicked)
+
+        btn_row.addStretch()
+        btn_row.addWidget(self.btn_apply)
+        btn_row.addWidget(self.btn_cancel)
+        layout.addLayout(btn_row)
+
+    # ── Apply button ──────────────────────────────────────────────────────────
+
+    def _on_apply_clicked(self):
+        jd = self.text_jd.toPlainText().strip()
+        if not jd:
+            QMessageBox.warning(self, "Empty Input",
+                                "Please paste a job description before applying.")
+            return
+
+        import datetime
+        session_id = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+
+        self.btn_apply.setEnabled(False)
+        self.btn_cancel.setText("Close")
+        self.lbl_status.setText("Status: Sending request to AI provider…")
+
+        self._ai_thread = AIThread(
+            provider=self._provider,
+            api_key=self._api_key,
+            latex=self._current_latex,
+            job_description=jd,
+            session_id=session_id,
+            pdf_dir=self._pdf_dir,
+        )
+        self._ai_thread.status_signal.connect(self._on_thread_status)
+        self._ai_thread.finished_signal.connect(self._on_thread_finished)
+        self._ai_thread.start()
+
+    def _on_cancel_clicked(self):
+        if self._ai_thread and self._ai_thread.isRunning():
+            # Don't kill the thread mid-flight; just close after it finishes
+            self.reject()
+            return
+        self.reject()
+
+    # ── Thread callbacks ──────────────────────────────────────────────────────
+
+    def _on_thread_status(self, text: str):
+        self.lbl_status.setText(text)
+
+    def _on_thread_finished(self, success: bool, result: str, pdf_path: str, log_dir: str):
+        self.btn_apply.setEnabled(True)
+
+        if success:
+            self.lbl_status.setText("Status: Done! Editor updated.")
+            self.latex_ready.emit(result, pdf_path)
+            self.accept()
+        else:
+            self.lbl_status.setText("Status: Failed — see error dialog.")
+            QMessageBox.critical(
+                self, "AI Tailor Error",
+                result,
+                QMessageBox.StandardButton.Ok,
+            )
+
+
+# ==========================================
 # Main Application Window
 # ==========================================
 class TailorTeXApp(QMainWindow):
@@ -414,7 +703,7 @@ class TailorTeXApp(QMainWindow):
         self.btn_make_template.clicked.connect(self.on_make_template_clicked)
 
         self.btn_ai = QPushButton("✨ AI Tailor")
-        self.btn_ai.clicked.connect(lambda: print("Action: Open AI Tailor"))
+        self.btn_ai.clicked.connect(self.on_ai_clicked)
 
         self.lbl_status = QLabel("Status: Ready")
         self.lbl_status.setStyleSheet("color: gray; font-weight: bold; margin-left: 15px;")
@@ -573,6 +862,60 @@ class TailorTeXApp(QMainWindow):
 
     def _load_source_into_editor(self, latex_source: str):
         self.editor.setPlainText(latex_source)
+
+    # --- AI Tailor ---
+
+    def on_ai_clicked(self):
+        """
+        1. If no provider/key is configured, open settings first.
+        2. Open the AI Tailor dialog.
+        """
+        provider = load_provider()
+        api_key  = load_api_key(provider) if provider else ""
+
+        if not provider or not api_key:
+            settings = AISettingsDialog(self)
+            if settings.exec() != QDialog.DialogCode.Accepted:
+                return
+            provider = settings.selected_provider()
+            api_key  = load_api_key(provider)
+
+        current_latex = self.editor.toPlainText()
+        if not current_latex.strip():
+            QMessageBox.warning(self, "Empty Editor",
+                                "There is no LaTeX in the editor to tailor.")
+            return
+
+        dialog = AITailorDialog(
+            current_latex=current_latex,
+            provider=provider,
+            api_key=api_key,
+            pdf_dir=GEN_PDF_DIR,
+            parent=self,
+        )
+        dialog.latex_ready.connect(self._on_ai_result)
+        dialog.exec()
+
+    def _on_ai_result(self, new_latex: str, pdf_filepath: str):
+        """Called when the AI thread produced valid, compiled LaTeX."""
+        self.editor.setPlainText(new_latex)
+        self.update_status("Status: AI tailoring applied successfully!")
+
+        # Save a snapshot of the AI-generated version
+        timestamp = make_timestamp()
+        try:
+            save_snapshot(new_latex, timestamp)
+        except Exception as e:
+            self.update_status(f"Status: AI applied, but snapshot failed: {e}")
+
+        # Show the compiled PDF in the right pane
+        if pdf_filepath and Path(pdf_filepath).exists():
+            self.pdf_document.load(pdf_filepath)
+            self.pdf_view.setZoomFactor(self.current_zoom)
+
+    def on_ai_settings_clicked(self):
+        """Standalone settings entry — can be hooked to a menu item later."""
+        AISettingsDialog(self).exec()
 
 
 if __name__ == "__main__":

@@ -1,0 +1,17 @@
+[
+  {
+    "name": "Classic Resume",
+    "tex_filepath": "templates/classic_resume.tex",
+    "pdf_filepath": "templates/previews/classic_resume.pdf"
+  },
+  {
+    "name": "Modern Resume",
+    "tex_filepath": "templates/modern_resume.tex",
+    "pdf_filepath": "templates/previews/modern_resume.pdf"
+  },
+  {
+    "name": "Modern",
+    "tex_filepath": "templates/modern.tex",
+    "pdf_filepath": "templates/previews/modern.pdf"
+  }
+]

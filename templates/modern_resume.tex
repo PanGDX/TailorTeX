@@ -1,0 +1,70 @@
+\documentclass[10pt,a4paper]{article}
+\usepackage[top=1.5cm, bottom=1.5cm, left=2cm, right=2cm]{geometry}
+\usepackage{array}
+\usepackage{xcolor}
+\usepackage{titlesec}
+\usepackage{enumitem}
+\usepackage{hyperref}
+\usepackage{tabularx}
+\usepackage{parskip}
+
+\definecolor{accent}{HTML}{2E4057}
+\titleformat{\section}{\bfseries\color{accent}\large}{}{0em}{}[{\color{accent}\titlerule}]
+\titlespacing{\section}{0pt}{8pt}{4pt}
+
+\begin{document}
+\pagestyle{empty}
+
+% ---- Header ----
+\begin{center}
+    {\Huge \textbf{\color{accent}Alex Rivera}} \\[6pt]
+    \small
+    alex.rivera@email.com \quad $\bullet$ \quad +44 7700 000000 \quad $\bullet$ \quad
+    \href{https://github.com/alexrivera}{github.com/alexrivera}
+\end{center}
+
+\vspace{4pt}
+
+% ---- Profile ----
+\section{Profile}
+Creative product designer with 7 years of experience crafting user-centred
+digital products. Proficient in end-to-end design processes from research
+to high-fidelity prototyping and developer hand-off.
+
+% ---- Experience ----
+\section{Experience}
+
+\noindent
+\begin{tabularx}{\textwidth}{@{}X r@{}}
+    \textbf{Lead Product Designer} --- \textit{DesignCo Ltd} & \textit{Mar 2020 -- Present}
+\end{tabularx}
+\begin{itemize}[nosep, left=12pt, topsep=2pt]
+    \item Redesigned core onboarding flow, lifting 30-day retention by 18\%.
+    \item Established a component library adopted across four product teams.
+\end{itemize}
+
+\vspace{4pt}
+
+\noindent
+\begin{tabularx}{\textwidth}{@{}X r@{}}
+    \textbf{UX Designer} --- \textit{Agency XYZ} & \textit{Aug 2017 -- Feb 2020}
+\end{tabularx}
+\begin{itemize}[nosep, left=12pt, topsep=2pt]
+    \item Delivered 20+ client projects spanning SaaS, e-commerce, and fintech.
+    \item Ran user interviews and usability sessions with 200+ participants.
+\end{itemize}
+
+% ---- Education ----
+\section{Education}
+
+\noindent
+\begin{tabularx}{\textwidth}{@{}X r@{}}
+    \textbf{M.A. Interaction Design} --- University of Arts London & \textit{2015 -- 2017}
+\end{tabularx}
+
+% ---- Skills ----
+\section{Skills}
+Figma \quad Sketch \quad Adobe XD \quad HTML/CSS \quad User Research \quad
+Prototyping \quad Design Systems \quad Accessibility (WCAG 2.1)
+
+\end{document}

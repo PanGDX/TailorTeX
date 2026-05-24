@@ -7,7 +7,7 @@ from PyQt6.QtWidgets import (
     QPushButton, QLabel, QPlainTextEdit, QSplitter, QDialog,
     QListWidget, QListWidgetItem, QMessageBox, QAbstractItemView,
     QStackedWidget, QInputDialog, QComboBox, QLineEdit, QFormLayout,
-    QGroupBox, QSizePolicy
+    QGroupBox, QSizePolicy, QProgressBar, QFrame
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QFont
@@ -30,8 +30,23 @@ AI_PROVIDERS = ["OpenAI", "Claude", "Google Gemini"]
 MAX_AI_RETRIES = 3
 
 GEN_PDF_DIR = "generated-pdfs"
-LATEX_CODE_DIR = "latex-files"
-TEMP_PNG_DIR = ".temp"
+BATCH_PDF_DIR = "generated-pdfs/batch"
+
+BATCH_JOB_TEMPLATE = """\
+## Job 1
+Company: 
+Job Role: 
+Job Scope:
+(Copy From Website)
+
+---
+
+## Job 2
+Company: 
+Job Role: 
+Job Scope:
+(Copy From Website)
+"""
 
 
 def make_timestamp() -> str:
@@ -663,6 +678,446 @@ class AITailorDialog(QDialog):
 
 
 # ==========================================
+# Batch Make — helpers
+# ==========================================
+
+def _parse_batch_jobs(text: str) -> list[str]:
+    """
+    Split the batch input text on '---' separators.
+    Each chunk is stripped; empty chunks are discarded.
+    Returns a list of job description strings.
+    """
+    chunks = text.split("---")
+    jobs = [c.strip() for c in chunks if c.strip()]
+    return jobs
+
+
+def _slugify(text: str, max_len: int = 40) -> str:
+    """Turn 'Acme Corp / Senior Engineer' into 'acme-corp-senior-engineer'."""
+    import re
+    text = text.lower()
+    text = re.sub(r"[^\w\s-]", "", text)
+    text = re.sub(r"[\s/\\]+", "-", text)
+    text = re.sub(r"-+", "-", text).strip("-")
+    return text[:max_len]
+
+
+def _extract_job_label(job_text: str) -> str:
+    """
+    Try to extract a human-readable label from a job block.
+    Looks for 'Company:' and 'Job Role:' lines; falls back to first line.
+    """
+    company = ""
+    role    = ""
+    for line in job_text.splitlines():
+        stripped = line.strip()
+        if stripped.lower().startswith("company:"):
+            company = stripped.split(":", 1)[1].strip()
+        elif stripped.lower().startswith("job role:"):
+            role = stripped.split(":", 1)[1].strip()
+        if company and role:
+            break
+    if company or role:
+        parts = [p for p in [company, role] if p]
+        return " / ".join(parts)
+    # Fallback: first non-empty, non-header line
+    for line in job_text.splitlines():
+        s = line.strip().lstrip("#").strip()
+        if s:
+            return s[:60]
+    return "Untitled Job"
+
+
+# ==========================================
+# Batch Make — background thread
+# ==========================================
+class BatchThread(QThread):
+    """
+    Processes a list of job descriptions sequentially against the same base LaTeX.
+
+    Signals:
+        job_started(int, str)           index, label
+        job_status(int, str)            index, status text
+        job_done(int, bool, str, str)   index, success, latex_or_error, pdf_path
+        all_done()
+    """
+    job_started = pyqtSignal(int, str)
+    job_status  = pyqtSignal(int, str)
+    job_done    = pyqtSignal(int, bool, str, str)
+    all_done    = pyqtSignal()
+
+    def __init__(self, provider: str, api_key: str,
+                 base_latex: str, jobs: list[str],
+                 batch_id: str, pdf_dir: str):
+        super().__init__()
+        self.provider    = provider
+        self.api_key     = api_key
+        self.base_latex  = base_latex
+        self.jobs        = jobs
+        self.batch_id    = batch_id
+        self.pdf_dir     = pdf_dir
+        self._stop       = False
+
+    def stop(self):
+        self._stop = True
+
+    def run(self):
+        import os
+        os.makedirs(self.pdf_dir, exist_ok=True)
+
+        for idx, job_desc in enumerate(self.jobs):
+            if self._stop:
+                break
+
+            label = _extract_job_label(job_desc)
+            self.job_started.emit(idx, label)
+
+            session_id = f"{self.batch_id}_job{idx}"
+            messages   = build_initial_messages(self.base_latex, job_desc)
+            last_latex = ""
+            last_error = ""
+            success    = False
+
+            for attempt in range(1, MAX_AI_RETRIES + 1):
+                if self._stop:
+                    break
+
+                self.job_status.emit(
+                    idx,
+                    f"Attempt {attempt}/{MAX_AI_RETRIES} — waiting for AI…"
+                )
+                try:
+                    new_latex, _ = request_latex(
+                        provider=self.provider,
+                        api_key=self.api_key,
+                        messages=messages,
+                        session_id=session_id,
+                        attempt=attempt,
+                    )
+                except Exception as exc:
+                    self.job_done.emit(idx, False, f"AI request failed: {exc}", "")
+                    break
+
+                last_latex = new_latex
+                self.job_status.emit(idx, f"Attempt {attempt}/{MAX_AI_RETRIES} — compiling…")
+
+                slug     = _slugify(label) or f"job{idx}"
+                pdf_name = f"{slug}_attempt{attempt}.pdf"
+                pdf_path = os.path.join(self.pdf_dir, pdf_name)
+
+                ok, compile_msg = compile_latex_to_pdf(new_latex, pdf_path)
+
+                if ok:
+                    success = True
+                    self.job_done.emit(idx, True, new_latex, pdf_path)
+                    break
+
+                last_error = compile_msg
+                if attempt < MAX_AI_RETRIES:
+                    self.job_status.emit(
+                        idx, f"Compile failed (attempt {attempt}), retrying…"
+                    )
+                    messages = build_retry_messages(messages, new_latex, compile_msg)
+
+            if not success and not self._stop:
+                err = (
+                    f"LaTeX did not compile after {MAX_AI_RETRIES} attempts.\n"
+                    f"Last error:\n{last_error}"
+                )
+                self.job_done.emit(idx, False, err, "")
+
+        self.all_done.emit()
+
+
+# ==========================================
+# Batch Make — dialog
+# ==========================================
+
+# Status icons shown in the job list
+_ICON_WAITING  = "⬜"
+_ICON_RUNNING  = "🔄"
+_ICON_OK       = "✅"
+_ICON_FAIL     = "❌"
+
+
+class BatchMakeDialog(QDialog):
+    """
+    Two-phase dialog:
+      Phase 1 — user edits the markdown job list, then clicks Run.
+      Phase 2 — progress view; each job row shows live status.
+
+    On completion the user can load any successful result into the editor.
+    """
+    load_into_editor = pyqtSignal(str, str)   # (latex, pdf_path)
+
+    def __init__(self, base_latex: str, provider: str, api_key: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Batch Make — AI Resume Tailoring")
+        self.resize(780, 620)
+        self.setModal(True)
+
+        self._base_latex  = base_latex
+        self._provider    = provider
+        self._api_key     = api_key
+        self._thread: BatchThread | None = None
+
+        # Per-job result storage: index → (success, latex, pdf_path)
+        self._results: dict[int, tuple[bool, str, str]] = {}
+
+        self._build_ui()
+
+    # ── UI construction ───────────────────────────────────────────────────────
+
+    def _build_ui(self):
+        self._outer = QVBoxLayout(self)
+        self._outer.setSpacing(8)
+
+        # Provider badge
+        badge = QLabel(f"Provider: <b>{self._provider}</b>  |  Base document: current editor content")
+        badge.setStyleSheet("color: gray; font-size: 11px;")
+        self._outer.addWidget(badge)
+
+        # ── Stacked pages ─────────────────────────────────────────────────────
+        self._stack = QStackedWidget()
+        self._outer.addWidget(self._stack, stretch=1)
+
+        self._stack.addWidget(self._build_input_page())   # index 0
+        self._stack.addWidget(self._build_progress_page()) # index 1
+
+        # ── Bottom button row ─────────────────────────────────────────────────
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setStyleSheet("color: #ccc;")
+        self._outer.addWidget(sep)
+
+        btn_row = QHBoxLayout()
+
+        self.btn_run = QPushButton("▶  Run Batch")
+        self.btn_run.setDefault(True)
+        self.btn_run.clicked.connect(self._on_run_clicked)
+
+        self.btn_stop = QPushButton("⏹  Stop")
+        self.btn_stop.setEnabled(False)
+        self.btn_stop.clicked.connect(self._on_stop_clicked)
+
+        self.btn_close = QPushButton("Close")
+        self.btn_close.clicked.connect(self._on_close_clicked)
+
+        btn_row.addWidget(self.btn_run)
+        btn_row.addWidget(self.btn_stop)
+        btn_row.addStretch()
+        btn_row.addWidget(self.btn_close)
+        self._outer.addLayout(btn_row)
+
+    def _build_input_page(self) -> QWidget:
+        page   = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        lbl = QLabel(
+            "Define one job per section, separated by <b>---</b>. "
+            "Fill in Company, Job Role, and paste the Job Scope from the website."
+        )
+        lbl.setWordWrap(True)
+        layout.addWidget(lbl)
+
+        self.text_jobs = QPlainTextEdit()
+        self.text_jobs.setPlainText(BATCH_JOB_TEMPLATE)   # pre-filled, not placeholder
+        self.text_jobs.setFont(QFont("Courier New", 10))
+        layout.addWidget(self.text_jobs, stretch=1)
+
+        return page
+
+    def _build_progress_page(self) -> QWidget:
+        page   = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+
+        hdr = QLabel("<b>Batch progress</b>")
+        layout.addWidget(hdr)
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setTextVisible(True)
+        layout.addWidget(self.progress_bar)
+
+        # Job list: each item shows icon + label + status
+        self.job_list = QListWidget()
+        self.job_list.setAlternatingRowColors(True)
+        self.job_list.setFont(QFont("Courier New", 10))
+        layout.addWidget(self.job_list, stretch=1)
+
+        # Load-into-editor button (enabled only when a successful job is selected)
+        self.btn_load_result = QPushButton("📂  Load Selected into Editor")
+        self.btn_load_result.setEnabled(False)
+        self.btn_load_result.clicked.connect(self._on_load_result_clicked)
+        layout.addWidget(self.btn_load_result)
+
+        self.job_list.currentRowChanged.connect(self._on_job_row_changed)
+
+        return page
+
+    # ── Phase 1 → 2 transition ────────────────────────────────────────────────
+
+    def _on_run_clicked(self):
+        raw_text = self.text_jobs.toPlainText()
+        jobs     = _parse_batch_jobs(raw_text)
+
+        if not jobs:
+            QMessageBox.warning(
+                self, "No Jobs",
+                "No job blocks were found. Make sure sections are separated by ---."
+            )
+            return
+
+        # Warn if any job still has unfilled placeholder text
+        placeholder_warn = any(
+            "(Copy From Website)" in j or j.strip() == BATCH_JOB_TEMPLATE.strip()
+            for j in jobs
+        )
+        if placeholder_warn:
+            if QMessageBox.question(
+                self, "Unfilled Template",
+                "Some job sections still contain placeholder text.\n"
+                "Continue anyway?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            ) != QMessageBox.StandardButton.Yes:
+                return
+
+        self._start_batch(jobs)
+
+    def _start_batch(self, jobs: list[str]):
+        import datetime, os
+        batch_id  = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        pdf_dir   = os.path.join(BATCH_PDF_DIR, batch_id)
+
+        # Populate job list rows
+        self.job_list.clear()
+        self._results.clear()
+        for idx, job in enumerate(jobs):
+            label = _extract_job_label(job)
+            item  = QListWidgetItem(f"  {_ICON_WAITING}  {label}")
+            self.job_list.addItem(item)
+
+        self.progress_bar.setMaximum(len(jobs))
+        self.progress_bar.setValue(0)
+
+        # Switch to progress page
+        self._stack.setCurrentIndex(1)
+        self.btn_run.setEnabled(False)
+        self.btn_stop.setEnabled(True)
+
+        self._thread = BatchThread(
+            provider=self._provider,
+            api_key=self._api_key,
+            base_latex=self._base_latex,
+            jobs=jobs,
+            batch_id=batch_id,
+            pdf_dir=pdf_dir,
+        )
+        self._thread.job_started.connect(self._on_job_started)
+        self._thread.job_status.connect(self._on_job_status)
+        self._thread.job_done.connect(self._on_job_done)
+        self._thread.all_done.connect(self._on_all_done)
+        self._thread.start()
+
+    # ── BatchThread signal handlers ───────────────────────────────────────────
+
+    def _on_job_started(self, idx: int, label: str):
+        item = self.job_list.item(idx)
+        if item:
+            item.setText(f"  {_ICON_RUNNING}  {label}  —  starting…")
+
+    def _on_job_status(self, idx: int, status: str):
+        item = self.job_list.item(idx)
+        if item:
+            # Keep the label, update the trailing status
+            parts = item.text().split("  —  ", 1)
+            base  = parts[0] if parts else item.text()
+            item.setText(f"{base}  —  {status}")
+
+    def _on_job_done(self, idx: int, success: bool, latex_or_error: str, pdf_path: str):
+        self._results[idx] = (success, latex_or_error, pdf_path)
+
+        item = self.job_list.item(idx)
+        if item:
+            parts  = item.text().split("  —  ", 1)
+            # Strip the running icon, replace with result icon
+            raw    = parts[0].strip()
+            for icon in (_ICON_WAITING, _ICON_RUNNING, _ICON_OK, _ICON_FAIL):
+                raw = raw.replace(icon, "").strip()
+            icon   = _ICON_OK if success else _ICON_FAIL
+            status = "Done ✓" if success else "Failed"
+            item.setText(f"  {icon}  {raw}  —  {status}")
+
+        done = sum(1 for (s, _, __) in self._results.values() if True)
+        self.progress_bar.setValue(len(self._results))
+
+    def _on_all_done(self):
+        self.btn_stop.setEnabled(False)
+        self.btn_run.setEnabled(True)
+
+        total   = self.job_list.count()
+        success = sum(1 for (s, _, __) in self._results.values() if s)
+        failed  = total - success
+
+        self.progress_bar.setFormat(f"Complete — {success}/{total} succeeded")
+        if failed:
+            self.progress_bar.setStyleSheet("QProgressBar::chunk { background: #e07b39; }")
+        else:
+            self.progress_bar.setStyleSheet("QProgressBar::chunk { background: #4caf50; }")
+
+    def _on_job_row_changed(self, row: int):
+        if row < 0 or row not in self._results:
+            self.btn_load_result.setEnabled(False)
+            return
+        success, _, pdf_path = self._results[row]
+        self.btn_load_result.setEnabled(success and bool(pdf_path))
+
+    def _on_load_result_clicked(self):
+        row = self.job_list.currentRow()
+        if row < 0 or row not in self._results:
+            return
+        success, latex, pdf_path = self._results[row]
+        if not success:
+            return
+        label = _extract_job_label(self._thread.jobs[row] if self._thread else "")
+        if QMessageBox.question(
+            self, "Load into Editor",
+            f"Replace the current editor content with the result for:\n\n"
+            f"{label}\n\n"
+            "Unsaved changes will be overwritten.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+        ) == QMessageBox.StandardButton.Yes:
+            self.load_into_editor.emit(latex, pdf_path)
+            self.accept()
+
+    # ── Close / stop ──────────────────────────────────────────────────────────
+
+    def _on_stop_clicked(self):
+        if self._thread and self._thread.isRunning():
+            self._thread.stop()
+            self.btn_stop.setEnabled(False)
+            self.progress_bar.setFormat("Stopping after current job…")
+
+    def _on_close_clicked(self):
+        if self._thread and self._thread.isRunning():
+            if QMessageBox.question(
+                self, "Batch Running",
+                "A batch is still running. Stop it and close?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            ) != QMessageBox.StandardButton.Yes:
+                return
+            self._thread.stop()
+        self.reject()
+
+    def closeEvent(self, event):
+        if self._thread and self._thread.isRunning():
+            self._thread.stop()
+        event.accept()
+
+
+# ==========================================
 # Main Application Window
 # ==========================================
 class TailorTeXApp(QMainWindow):
@@ -671,8 +1126,7 @@ class TailorTeXApp(QMainWindow):
         self.setWindowTitle("TailorTeX - Resume Tailoring Tool")
         self.resize(1280, 720)
 
-        for directory in [GEN_PDF_DIR, LATEX_CODE_DIR, TEMP_PNG_DIR]:
-            Path(f"./{directory}").mkdir(parents=True, exist_ok=True)
+        Path(f"./{GEN_PDF_DIR}").mkdir(parents=True, exist_ok=True)
 
         # Seed default templates on every launch (no-ops if already present)
         seed_default_templates()
@@ -705,11 +1159,14 @@ class TailorTeXApp(QMainWindow):
         self.btn_ai = QPushButton("✨ AI Tailor")
         self.btn_ai.clicked.connect(self.on_ai_clicked)
 
+        self.btn_batch = QPushButton("📋 Batch Make")
+        self.btn_batch.clicked.connect(self.on_batch_clicked)
+
         self.lbl_status = QLabel("Status: Ready")
         self.lbl_status.setStyleSheet("color: gray; font-weight: bold; margin-left: 15px;")
 
         for btn in [self.btn_compile, self.btn_templates, self.btn_snapshots,
-                    self.btn_make_template, self.btn_ai]:
+                    self.btn_make_template, self.btn_ai, self.btn_batch]:
             toolbar_layout.addWidget(btn)
         toolbar_layout.addWidget(self.lbl_status)
         toolbar_layout.addStretch()
@@ -810,7 +1267,8 @@ class TailorTeXApp(QMainWindow):
 
     def _set_toolbar_enabled(self, enabled: bool):
         for btn in [self.btn_compile, self.btn_make_template,
-                    self.btn_templates, self.btn_snapshots, self.btn_ai]:
+                    self.btn_templates, self.btn_snapshots,
+                    self.btn_ai, self.btn_batch]:
             btn.setEnabled(enabled)
 
     def update_status(self, text: str):
@@ -916,6 +1374,50 @@ class TailorTeXApp(QMainWindow):
     def on_ai_settings_clicked(self):
         """Standalone settings entry — can be hooked to a menu item later."""
         AISettingsDialog(self).exec()
+
+    # --- Batch Make ---
+
+    def on_batch_clicked(self):
+        """Open the Batch Make dialog."""
+        provider = load_provider()
+        api_key  = load_api_key(provider) if provider else ""
+
+        if not provider or not api_key:
+            settings = AISettingsDialog(self)
+            if settings.exec() != QDialog.DialogCode.Accepted:
+                return
+            provider = settings.selected_provider()
+            api_key  = load_api_key(provider)
+
+        current_latex = self.editor.toPlainText()
+        if not current_latex.strip():
+            QMessageBox.warning(self, "Empty Editor",
+                                "There is no LaTeX in the editor to use as the base document.")
+            return
+
+        dialog = BatchMakeDialog(
+            base_latex=current_latex,
+            provider=provider,
+            api_key=api_key,
+            parent=self,
+        )
+        dialog.load_into_editor.connect(self._on_batch_load_result)
+        dialog.exec()
+
+    def _on_batch_load_result(self, latex: str, pdf_path: str):
+        """Load a batch result into the editor and PDF viewer."""
+        self.editor.setPlainText(latex)
+        self.update_status("Status: Batch result loaded into editor.")
+
+        timestamp = make_timestamp()
+        try:
+            save_snapshot(latex, timestamp)
+        except Exception as e:
+            self.update_status(f"Status: Loaded, but snapshot failed: {e}")
+
+        if pdf_path and Path(pdf_path).exists():
+            self.pdf_document.load(pdf_path)
+            self.pdf_view.setZoomFactor(self.current_zoom)
 
 
 if __name__ == "__main__":

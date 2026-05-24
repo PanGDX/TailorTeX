@@ -30,8 +30,6 @@ AI_PROVIDERS = ["OpenAI", "Claude", "Google Gemini"]
 MAX_AI_RETRIES = 3
 
 GEN_PDF_DIR = "generated-pdfs"
-LATEX_CODE_DIR = "latex-files"
-TEMP_PNG_DIR = ".temp"
 BATCH_PDF_DIR = "generated-pdfs/batch"
 
 BATCH_JOB_TEMPLATE = """\
@@ -1128,8 +1126,7 @@ class TailorTeXApp(QMainWindow):
         self.setWindowTitle("TailorTeX - Resume Tailoring Tool")
         self.resize(1280, 720)
 
-        for directory in [GEN_PDF_DIR, LATEX_CODE_DIR, TEMP_PNG_DIR]:
-            Path(f"./{directory}").mkdir(parents=True, exist_ok=True)
+        Path(f"./{GEN_PDF_DIR}").mkdir(parents=True, exist_ok=True)
 
         # Seed default templates on every launch (no-ops if already present)
         seed_default_templates()

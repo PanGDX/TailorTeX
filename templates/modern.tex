@@ -1,0 +1,52 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{enumitem}
+\usepackage{titlesec}
+\usepackage{hyperref}
+\usepackage{parskip}
+
+\titleformat{\section}{\large\bfseries}{}{0em}{}[\titlerule]
+\titlespacing{\section}{0pt}{10pt}{4pt}
+
+\begin{document}
+
+% ---- Header ----
+\begin{center}
+    {\LARGE \textbf{Jane Doe}} \\[4pt]
+    jane.doe@email.com \quad | \quad +1 (555) 000-0000 \quad | \quad
+    \href{https://linkedin.com/in/janedoe}{linkedin.com/in/janedoe}
+\end{center}
+
+% ---- Summary ----
+\section{Summary}
+Results-driven software engineer with 5 years of experience building
+scalable web applications. Strong communicator and collaborative team member.
+
+% ---- Experience ----
+\section{Experience}
+
+\textbf{Senior Software Engineer} \hfill Jan 2021 -- Present \\
+\textit{Acme Corp, San Francisco, CA}
+\begin{itemize}[nosep, left=0pt]
+    \item Led migration of monolithic service to microservices, reducing
+          deploy time by 40\%.
+    \item Mentored three junior engineers and ran bi-weekly code reviews.
+\end{itemize}
+
+\textbf{Software Engineer} \hfill Jun 2019 -- Dec 2020 \\
+\textit{Startup Inc, Remote}
+\begin{itemize}[nosep, left=0pt]
+    \item Built REST APIs consumed by 50k daily active users.
+    \item Implemented CI/CD pipeline using GitHub Actions and Docker.
+\end{itemize}
+
+% ---- Education ----
+\section{Education}
+\textbf{B.Sc. Computer Science} \hfill 2015 -- 2019 \\
+University of Example, Example City
+
+% ---- Skills ----
+\section{Skills}
+Python, Go, TypeScript, PostgreSQL, Docker, Kubernetes, AWS, Git
+
+\end{document}

@@ -5,7 +5,8 @@ from pathlib import Path
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QPlainTextEdit, QSplitter, QDialog,
-    QListWidget, QListWidgetItem, QMessageBox, QAbstractItemView, QStackedWidget
+    QListWidget, QListWidgetItem, QMessageBox, QAbstractItemView,
+    QStackedWidget, QInputDialog
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QFont
@@ -14,7 +15,10 @@ from PyQt6.QtPdf import QPdfDocument
 from PyQt6.QtPdfWidgets import QPdfView
 
 from compiler import compile_latex_to_pdf
-from snapshot_manager import save_snapshot, load_index, load_snapshot_content, delete_snapshot
+from snapshot_manager import save_snapshot, load_index as snap_load_index, \
+    load_snapshot_content, delete_snapshot
+from template_manager import seed_default_templates, save_template, \
+    load_index as tmpl_load_index, load_template_content, delete_template
 
 GEN_PDF_DIR = "generated-pdfs"
 LATEX_CODE_DIR = "latex-files"
@@ -22,7 +26,6 @@ TEMP_PNG_DIR = ".temp"
 
 
 def make_timestamp() -> str:
-    """Single source of truth for the timestamp format used across PDF, .tex, and index."""
     return datetime.datetime.now().strftime("%Y-%m-%d %H-%M-%S")
 
 
@@ -68,10 +71,54 @@ class ErrorDialog(QDialog):
 
 
 # ==========================================
-# Snapshots Modal Dialog
+# Shared PDF-preview panel
+# (reused identically in both dialogs)
+# ==========================================
+class PdfPreviewPanel(QWidget):
+    """
+    A QStackedWidget wrapper that shows either:
+      - a centred placeholder label  (index 0)
+      - a live QPdfView              (index 1)
+    """
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        self.stack = QStackedWidget()
+        layout.addWidget(self.stack)
+
+        self._lbl = QLabel()
+        self._lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._lbl.setStyleSheet("color: gray; font-size: 14px;")
+        self.stack.addWidget(self._lbl)          # index 0
+
+        self._doc = QPdfDocument(self)
+        self._view = QPdfView(self)
+        self._view.setDocument(self._doc)
+        self._view.setPageMode(QPdfView.PageMode.MultiPage)
+        self._view.setZoomMode(QPdfView.ZoomMode.FitToWidth)
+        self.stack.addWidget(self._view)         # index 1
+
+        self.show_placeholder("Select an entry to preview")
+
+    def show_placeholder(self, text: str):
+        self._lbl.setText(text)
+        self.stack.setCurrentIndex(0)
+
+    def show_pdf(self, pdf_filepath: str):
+        self._doc.close()
+        result = self._doc.load(pdf_filepath)
+        if result == QPdfDocument.Error.None_:
+            self.stack.setCurrentIndex(1)
+        else:
+            self.show_placeholder("PDF-NOT-FOUND")
+
+
+# ==========================================
+# Snapshots Dialog
 # ==========================================
 class SnapshotsDialog(QDialog):
-    # Emitted when the user confirms loading; carries the LaTeX source string
     load_requested = pyqtSignal(str)
 
     def __init__(self, parent=None):
@@ -79,29 +126,23 @@ class SnapshotsDialog(QDialog):
         self.setWindowTitle("Snapshots")
         self.resize(960, 560)
         self.setModal(True)
-
         self._entries: list[dict] = []
 
-        # Outer layout: list on the left, preview on the right
-        outer_layout = QHBoxLayout(self)
+        outer = QHBoxLayout(self)
 
-        # ---- Left column: list + action buttons ----
-        left_widget = QWidget()
-        left_widget.setFixedWidth(320)
-        left_layout = QVBoxLayout(left_widget)
-        left_layout.setContentsMargins(0, 0, 8, 0)
+        # Left column
+        left = QWidget()
+        left.setFixedWidth(300)
+        ll = QVBoxLayout(left)
+        ll.setContentsMargins(0, 0, 8, 0)
 
-        header = QLabel("Saved snapshots")
-        header.setStyleSheet("font-weight: bold; margin-bottom: 4px;")
-        left_layout.addWidget(header)
+        ll.addWidget(QLabel("<b>Saved snapshots</b>"))
 
         self.list_widget = QListWidget()
         self.list_widget.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.list_widget.setAlternatingRowColors(True)
         self.list_widget.currentRowChanged.connect(self._on_row_changed)
-        left_layout.addWidget(self.list_widget)
-
-        btn_layout = QHBoxLayout()
+        ll.addWidget(self.list_widget)
 
         self.btn_load = QPushButton("Load into Editor")
         self.btn_load.setEnabled(False)
@@ -115,141 +156,220 @@ class SnapshotsDialog(QDialog):
         btn_close = QPushButton("Close")
         btn_close.clicked.connect(self.reject)
 
-        btn_layout.addWidget(self.btn_load)
-        btn_layout.addWidget(self.btn_delete)
-        btn_layout.addWidget(btn_close)
-        left_layout.addLayout(btn_layout)
+        btns = QHBoxLayout()
+        btns.addWidget(self.btn_load)
+        btns.addWidget(self.btn_delete)
+        btns.addWidget(btn_close)
+        ll.addLayout(btns)
 
-        outer_layout.addWidget(left_widget)
+        outer.addWidget(left)
 
-        # ---- Right column: PDF preview (or not-found label) ----
-        right_widget = QWidget()
-        right_layout = QVBoxLayout(right_widget)
-        right_layout.setContentsMargins(0, 0, 0, 0)
-
-        preview_label = QLabel("Preview:")
-        preview_label.setStyleSheet("font-weight: bold; margin-bottom: 4px;")
-        right_layout.addWidget(preview_label)
-
-        # QStackedWidget lets us swap between the PDF viewer and the
-        # "PDF not found" placeholder without any show/hide juggling
-        self.preview_stack = QStackedWidget()
-        right_layout.addWidget(self.preview_stack)
-
-        # Page 0 — placeholder shown before any selection or when PDF is missing
-        self.lbl_no_pdf = QLabel()
-        self.lbl_no_pdf.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.lbl_no_pdf.setStyleSheet("color: gray; font-size: 14px;")
-        self.lbl_no_pdf.setText("Select a snapshot to preview")
-        self.preview_stack.addWidget(self.lbl_no_pdf)   # index 0
-
-        # Page 1 — live QPdfView
-        self.preview_pdf_doc = QPdfDocument(self)
-        self.preview_pdf_view = QPdfView(self)
-        self.preview_pdf_view.setDocument(self.preview_pdf_doc)
-        self.preview_pdf_view.setPageMode(QPdfView.PageMode.MultiPage)
-        self.preview_pdf_view.setZoomMode(QPdfView.ZoomMode.FitToWidth)
-        self.preview_stack.addWidget(self.preview_pdf_view)  # index 1
-
-        outer_layout.addWidget(right_widget, stretch=1)
+        # Right column — PDF preview
+        right = QWidget()
+        rl = QVBoxLayout(right)
+        rl.setContentsMargins(0, 0, 0, 0)
+        rl.addWidget(QLabel("<b>Preview</b>"))
+        self.preview = PdfPreviewPanel()
+        rl.addWidget(self.preview)
+        outer.addWidget(right, stretch=1)
 
         self._populate()
 
-    # ---- Internal helpers ----
-
     def _populate(self):
         self.list_widget.clear()
-        self._show_placeholder("Select a snapshot to preview")
+        self.preview.show_placeholder("Select a snapshot to preview")
         self.btn_load.setEnabled(False)
         self.btn_delete.setEnabled(False)
-
-        self._entries = load_index()
+        self._entries = snap_load_index()
 
         if not self._entries:
-            placeholder = QListWidgetItem("No snapshots yet.")
-            placeholder.setFlags(Qt.ItemFlag.NoItemFlags)
-            self.list_widget.addItem(placeholder)
+            item = QListWidgetItem("No snapshots yet.")
+            item.setFlags(Qt.ItemFlag.NoItemFlags)
+            self.list_widget.addItem(item)
             return
+        for e in self._entries:
+            self.list_widget.addItem(QListWidgetItem(f"  {e['timestamp']}"))
 
-        for entry in self._entries:
-            self.list_widget.addItem(QListWidgetItem(f"  {entry['timestamp']}"))
-
-    def _selected_entry(self) -> dict | None:
+    def _selected(self) -> dict | None:
         row = self.list_widget.currentRow()
-        if row < 0 or row >= len(self._entries):
-            return None
-        return self._entries[row]
+        return self._entries[row] if 0 <= row < len(self._entries) else None
 
-    def _show_placeholder(self, text: str):
-        self.lbl_no_pdf.setText(text)
-        self.preview_stack.setCurrentIndex(0)
-
-    def _show_pdf(self, pdf_filepath: str):
-        self.preview_pdf_doc.close()
-        result = self.preview_pdf_doc.load(pdf_filepath)
-        if result == QPdfDocument.Error.None_:
-            self.preview_stack.setCurrentIndex(1)
-        else:
-            # load() succeeded in opening the file but reported a non-Ready
-            # status — treat it the same as missing
-            self._show_placeholder("PDF-NOT-FOUND")
-
-    def _on_row_changed(self, row: int):
-        entry = self._selected_entry()
-        if entry is None:
-            self._show_placeholder("Select a snapshot to preview")
+    def _on_row_changed(self, _row):
+        e = self._selected()
+        if e is None:
+            self.preview.show_placeholder("Select a snapshot to preview")
             self.btn_load.setEnabled(False)
             self.btn_delete.setEnabled(False)
             return
-
         self.btn_load.setEnabled(True)
         self.btn_delete.setEnabled(True)
-
-        pdf_path = entry.get("pdf_filepath", "")
-        if pdf_path and Path(pdf_path).exists():
-            self._show_pdf(pdf_path)
+        pdf = e.get("pdf_filepath", "")
+        if pdf and Path(pdf).exists():
+            self.preview.show_pdf(pdf)
         else:
-            self._show_placeholder("PDF-NOT-FOUND")
+            self.preview.show_placeholder("PDF-NOT-FOUND")
 
     def _on_load_clicked(self):
-        entry = self._selected_entry()
-        
-        if entry is None:
+        e = self._selected()
+        if e is None:
             return
         try:
-            content = load_snapshot_content(entry["tex_filepath"])
+            content = load_snapshot_content(e["tex_filepath"])
         except FileNotFoundError:
             QMessageBox.warning(self, "File Missing",
-                                f"The .tex file could not be found:\n{entry['tex_filepath']}. Proceeding to delete this erroneous entry.")
-            delete_snapshot(entry["tex_filepath"])
+                                f"The .tex file could not be found:\n{e['tex_filepath']}. Proceeding to delete erroneous snapshot.")
+            delete_snapshot(e["tex_filepath"])
             self.accept()
             return
-
-        confirm = QMessageBox.question(
-            self,
-            "Load Snapshot",
-            f"Replace the current editor content with the snapshot from {entry['timestamp']}?\n\n"
+        if QMessageBox.question(
+            self, "Load Snapshot",
+            f"Replace the current editor content with the snapshot from {e['timestamp']}?\n\n"
             "Unsaved work in the editor will be overwritten.",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
-        )
-        if confirm == QMessageBox.StandardButton.Yes:
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel
+        ) == QMessageBox.StandardButton.Yes:
             self.load_requested.emit(content)
             self.accept()
 
     def _on_delete_clicked(self):
-        entry = self._selected_entry()
-        if entry is None:
+        e = self._selected()
+        if e is None:
             return
-
-        confirm = QMessageBox.question(
-            self,
-            "Delete Snapshot",
-            f"Permanently delete the snapshot from {entry['timestamp']}?\n\n"
+        if QMessageBox.question(
+            self, "Delete Snapshot",
+            f"Permanently delete the snapshot from {e['timestamp']}?\n\n"
             "The associated PDF in generated-pdfs/ will not be removed.",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
-        )
-        if confirm == QMessageBox.StandardButton.Yes:
-            delete_snapshot(entry["tex_filepath"])
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel
+        ) == QMessageBox.StandardButton.Yes:
+            delete_snapshot(e["tex_filepath"])
+            self._populate()
+
+
+# ==========================================
+# Templates Dialog
+# ==========================================
+class TemplatesDialog(QDialog):
+    load_requested = pyqtSignal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Templates")
+        self.resize(960, 560)
+        self.setModal(True)
+        self._entries: list[dict] = []
+
+        outer = QHBoxLayout(self)
+
+        # Left column
+        left = QWidget()
+        left.setFixedWidth(300)
+        ll = QVBoxLayout(left)
+        ll.setContentsMargins(0, 0, 8, 0)
+
+        ll.addWidget(QLabel("<b>Available templates</b>"))
+
+        self.list_widget = QListWidget()
+        self.list_widget.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.list_widget.setAlternatingRowColors(True)
+        self.list_widget.currentRowChanged.connect(self._on_row_changed)
+        ll.addWidget(self.list_widget)
+
+        self.btn_load = QPushButton("Load into Editor")
+        self.btn_load.setEnabled(False)
+        self.btn_load.clicked.connect(self._on_load_clicked)
+
+        self.btn_delete = QPushButton("Delete")
+        self.btn_delete.setEnabled(False)
+        self.btn_delete.setStyleSheet("color: red;")
+        self.btn_delete.clicked.connect(self._on_delete_clicked)
+
+        btn_close = QPushButton("Close")
+        btn_close.clicked.connect(self.reject)
+
+        btns = QHBoxLayout()
+        btns.addWidget(self.btn_load)
+        btns.addWidget(self.btn_delete)
+        btns.addWidget(btn_close)
+        ll.addLayout(btns)
+
+        outer.addWidget(left)
+
+        # Right column — PDF preview
+        right = QWidget()
+        rl = QVBoxLayout(right)
+        rl.setContentsMargins(0, 0, 0, 0)
+        rl.addWidget(QLabel("<b>Preview</b>"))
+        self.preview = PdfPreviewPanel()
+        rl.addWidget(self.preview)
+        outer.addWidget(right, stretch=1)
+
+        self._populate()
+
+    def _populate(self):
+        self.list_widget.clear()
+        self.preview.show_placeholder("Select a template to preview")
+        self.btn_load.setEnabled(False)
+        self.btn_delete.setEnabled(False)
+        self._entries = tmpl_load_index()
+
+        if not self._entries:
+            item = QListWidgetItem("No templates yet.")
+            item.setFlags(Qt.ItemFlag.NoItemFlags)
+            self.list_widget.addItem(item)
+            return
+        for e in self._entries:
+            self.list_widget.addItem(QListWidgetItem(f"  {e['name']}"))
+
+    def _selected(self) -> dict | None:
+        row = self.list_widget.currentRow()
+        return self._entries[row] if 0 <= row < len(self._entries) else None
+
+    def _on_row_changed(self, _row):
+        e = self._selected()
+        if e is None:
+            self.preview.show_placeholder("Select a template to preview")
+            self.btn_load.setEnabled(False)
+            self.btn_delete.setEnabled(False)
+            return
+        self.btn_load.setEnabled(True)
+        self.btn_delete.setEnabled(True)
+        pdf = e.get("pdf_filepath", "")
+        if pdf and Path(pdf).exists():
+            self.preview.show_pdf(pdf)
+        else:
+            self.preview.show_placeholder("PDF-NOT-FOUND")
+
+    def _on_load_clicked(self):
+        e = self._selected()
+        if e is None:
+            return
+        try:
+            content = load_template_content(e["tex_filepath"])
+        except FileNotFoundError:
+            QMessageBox.warning(self, "File Missing",
+                                f"The .tex file could not be found:\n{e['tex_filepath']}. Proceeding to delete erroneous template.")
+            delete_template(e["tex_filepath"])
+            self.accept()
+            return
+        if QMessageBox.question(
+            self, "Load Template",
+            f"Replace the current editor content with \"{e['name']}\"?\n\n"
+            "Unsaved work in the editor will be overwritten.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel
+        ) == QMessageBox.StandardButton.Yes:
+            self.load_requested.emit(content)
+            self.accept()
+
+    def _on_delete_clicked(self):
+        e = self._selected()
+        if e is None:
+            return
+        if QMessageBox.question(
+            self, "Delete Template",
+            f"Permanently delete the template \"{e['name']}\"?\n"
+            "This cannot be undone.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel
+        ) == QMessageBox.StandardButton.Yes:
+            delete_template(e["tex_filepath"])
             self._populate()
 
 
@@ -264,6 +384,9 @@ class TailorTeXApp(QMainWindow):
 
         for directory in [GEN_PDF_DIR, LATEX_CODE_DIR, TEMP_PNG_DIR]:
             Path(f"./{directory}").mkdir(parents=True, exist_ok=True)
+
+        # Seed default templates on every launch (no-ops if already present)
+        seed_default_templates()
 
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
@@ -282,10 +405,13 @@ class TailorTeXApp(QMainWindow):
         self.btn_compile.clicked.connect(self.on_compile_clicked)
 
         self.btn_templates = QPushButton("📄 Templates")
-        self.btn_templates.clicked.connect(lambda: print("Action: Open Templates"))
+        self.btn_templates.clicked.connect(self.on_templates_clicked)
 
         self.btn_snapshots = QPushButton("🕒 Snapshots")
         self.btn_snapshots.clicked.connect(self.on_snapshots_clicked)
+
+        self.btn_make_template = QPushButton("⭐ Make Template")
+        self.btn_make_template.clicked.connect(self.on_make_template_clicked)
 
         self.btn_ai = QPushButton("✨ AI Tailor")
         self.btn_ai.clicked.connect(lambda: print("Action: Open AI Tailor"))
@@ -293,7 +419,8 @@ class TailorTeXApp(QMainWindow):
         self.lbl_status = QLabel("Status: Ready")
         self.lbl_status.setStyleSheet("color: gray; font-weight: bold; margin-left: 15px;")
 
-        for btn in [self.btn_compile, self.btn_templates, self.btn_snapshots, self.btn_ai]:
+        for btn in [self.btn_compile, self.btn_templates, self.btn_snapshots,
+                    self.btn_make_template, self.btn_ai]:
             toolbar_layout.addWidget(btn)
         toolbar_layout.addWidget(self.lbl_status)
         toolbar_layout.addStretch()
@@ -306,7 +433,8 @@ class TailorTeXApp(QMainWindow):
 
         self.editor = QPlainTextEdit()
         self.editor.setPlainText(
-            "% Write your LaTeX here...\n\\documentclass{article}\n\\begin{document}\n\nHello World!\n\n\\end{document}"
+            "% Write your LaTeX here...\n\\documentclass{article}\n\\begin{document}\n\n"
+            "Hello World!\n\n\\end{document}"
         )
         font = QFont("Courier New", 11)
         font.setStyleHint(QFont.StyleHint.Monospace)
@@ -341,10 +469,14 @@ class TailorTeXApp(QMainWindow):
         self.splitter.addWidget(right_pane)
         self.splitter.setSizes([640, 640])
 
+        # Pending compile state
+        # _compile_mode is either "snapshot" or "template"
         self._pending_latex: str = ""
         self._pending_timestamp: str = ""
+        self._compile_mode: str = "snapshot"
+        self._pending_template_name: str = ""
 
-    # --- Toolbar Callbacks ---
+    # --- Zoom ---
 
     def zoom_in(self):
         self.current_zoom += 0.2
@@ -354,48 +486,92 @@ class TailorTeXApp(QMainWindow):
         self.current_zoom = max(0.2, self.current_zoom - 0.2)
         self.pdf_view.setZoomFactor(self.current_zoom)
 
-    def on_compile_clicked(self):
-        self.btn_compile.setEnabled(False)
+    # --- Compile (normal) ---
 
-        # Generate the timestamp once here — this exact string will be used
-        # for the PDF filename, the .tex filename, and the index entry.
+    def on_compile_clicked(self):
+        self._start_compile(mode="snapshot")
+
+    # --- Make This A Template ---
+
+    def on_make_template_clicked(self):
+        name, ok = QInputDialog.getText(
+            self, "Save as Template", "Template name:"
+        )
+        if not ok or not name.strip():
+            return  # user cancelled or left blank — don't compile
+
+        self._pending_template_name = name.strip()
+        self._start_compile(mode="template")
+
+    # --- Shared compile entry point ---
+
+    def _start_compile(self, mode: str):
+        self._set_toolbar_enabled(False)
         timestamp = make_timestamp()
         pdf_filepath = f"{GEN_PDF_DIR}/{timestamp}.pdf"
 
         self._pending_latex = self.editor.toPlainText()
         self._pending_timestamp = timestamp
+        self._compile_mode = mode
 
         self.thread = CompileThread(self._pending_latex, pdf_filepath)
         self.thread.status_signal.connect(self.update_status)
         self.thread.finished_signal.connect(self.on_compile_finished)
         self.thread.start()
 
-    def update_status(self, text):
+    def _set_toolbar_enabled(self, enabled: bool):
+        for btn in [self.btn_compile, self.btn_make_template,
+                    self.btn_templates, self.btn_snapshots, self.btn_ai]:
+            btn.setEnabled(enabled)
+
+    def update_status(self, text: str):
         self.lbl_status.setText(text)
 
-    def on_compile_finished(self, success, message, pdf_filepath):
-        self.btn_compile.setEnabled(True)
+    def on_compile_finished(self, success: bool, message: str, pdf_filepath: str):
+        self._set_toolbar_enabled(True)
 
-        if success:
-            self.update_status("Status: Ready (Compile Success!)")
-            self.pdf_document.load(pdf_filepath)
-            self.pdf_view.setZoomFactor(self.current_zoom)
+        if not success:
+            self.update_status("Status: Compile Failed!")
+            ErrorDialog(message, self).exec()
+            return
 
+        # --- Success ---
+        self.update_status("Status: Ready (Compile Success!)")
+        self.pdf_document.load(pdf_filepath)
+        self.pdf_view.setZoomFactor(self.current_zoom)
+
+        if self._compile_mode == "snapshot":
             try:
                 save_snapshot(self._pending_latex, self._pending_timestamp)
             except Exception as e:
                 self.update_status(f"Status: Compiled OK, but snapshot failed: {e}")
-        else:
-            self.update_status("Status: Compile Failed!")
-            dialog = ErrorDialog(message, self)
-            dialog.exec()
+
+        elif self._compile_mode == "template":
+            try:
+                save_template(
+                    name=self._pending_template_name,
+                    latex_code=self._pending_latex,
+                    compiled_pdf_filepath=pdf_filepath,
+                )
+                self.update_status(
+                    f"Status: Template \"{self._pending_template_name}\" saved!"
+                )
+            except Exception as e:
+                self.update_status(f"Status: Compiled OK, but template save failed: {e}")
+
+    # --- Dialog launchers ---
 
     def on_snapshots_clicked(self):
         dialog = SnapshotsDialog(self)
-        dialog.load_requested.connect(self.load_snapshot_into_editor)
+        dialog.load_requested.connect(self._load_source_into_editor)
         dialog.exec()
 
-    def load_snapshot_into_editor(self, latex_source: str):
+    def on_templates_clicked(self):
+        dialog = TemplatesDialog(self)
+        dialog.load_requested.connect(self._load_source_into_editor)
+        dialog.exec()
+
+    def _load_source_into_editor(self, latex_source: str):
         self.editor.setPlainText(latex_source)
 
 

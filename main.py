@@ -87,10 +87,17 @@ class TailorTeXApp(QMainWindow):
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         main_layout = QVBoxLayout(central_widget)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
 
         # --- Toolbar Setup ---
-        toolbar_layout = QHBoxLayout()
-        
+        # Wrap in a QWidget with a fixed height so it never expands beyond its content
+        toolbar_widget = QWidget()
+        toolbar_widget.setFixedHeight(44)
+        toolbar_layout = QHBoxLayout(toolbar_widget)
+        toolbar_layout.setContentsMargins(6, 4, 6, 4)
+        toolbar_layout.setSpacing(6)
+
         self.btn_compile = QPushButton("⚙ Compile")
         self.btn_compile.clicked.connect(self.on_compile_clicked)
         
@@ -109,21 +116,21 @@ class TailorTeXApp(QMainWindow):
         for btn in [self.btn_compile, self.btn_templates, self.btn_snapshots, self.btn_ai]:
             toolbar_layout.addWidget(btn)
         toolbar_layout.addWidget(self.lbl_status)
-        toolbar_layout.addStretch() # Pushes everything to the left
+        toolbar_layout.addStretch()
 
-        main_layout.addLayout(toolbar_layout)
+        # addWidget with stretch=0 keeps the toolbar at its fixed height;
+        # addWidget(splitter, stretch=1) gives all remaining space to the editor/viewer
+        main_layout.addWidget(toolbar_widget, 0)
 
         # --- Split Screen Setup ---
-        # QSplitter automatically provides a draggable divider
         self.splitter = QSplitter(Qt.Orientation.Horizontal)
-        main_layout.addWidget(self.splitter)
+        main_layout.addWidget(self.splitter, 1)  # stretch=1 → fills all remaining height
 
         # 1. LEFT PANE (Editor)
         self.editor = QPlainTextEdit()
         self.editor.setPlainText(
             "% Write your LaTeX here...\n\\documentclass{article}\n\\begin{document}\n\nHello World!\n\n\\end{document}"
         )
-        # Standardize a monospaced font for code
         font = QFont("Courier New", 11)
         font.setStyleHint(QFont.StyleHint.Monospace)
         self.editor.setFont(font)
@@ -157,7 +164,7 @@ class TailorTeXApp(QMainWindow):
         self.pdf_view.setDocument(self.pdf_document)
         self.pdf_view.setPageMode(QPdfView.PageMode.MultiPage)
         self.pdf_view.setZoomMode(QPdfView.ZoomMode.Custom)
-        self.current_zoom = 1.0 # Base zoom
+        self.current_zoom = 1.0
         
         right_layout.addWidget(self.pdf_view)
         self.splitter.addWidget(right_pane)
@@ -176,13 +183,11 @@ class TailorTeXApp(QMainWindow):
         self.pdf_view.setZoomFactor(self.current_zoom)
 
     def on_compile_clicked(self):
-        # Disable the compile button while compiling
         self.btn_compile.setEnabled(False)
         
         latex_code = self.editor.toPlainText()
         filepath = get_filepath()
 
-        # Spin up QThread
         self.thread = CompileThread(latex_code, filepath)
         self.thread.status_signal.connect(self.update_status)
         self.thread.finished_signal.connect(self.on_compile_finished)
@@ -196,23 +201,16 @@ class TailorTeXApp(QMainWindow):
 
         if success:
             self.update_status("Status: Ready (Compile Success!)")
-            # Natively load the PDF document into the viewer
             self.pdf_document.load(filepath)
             self.pdf_view.setZoomFactor(self.current_zoom)
         else:
             self.update_status("Status: Compile Failed!")
-            # Show the error modal
             dialog = ErrorDialog(message, self)
             dialog.exec()
 
 
 if __name__ == "__main__":
-    # Initialize the Qt Application
     app = QApplication(sys.argv)
-    
-    # Create and show the main window
     window = TailorTeXApp()
     window.show()
-    
-    # Start the event loop
     sys.exit(app.exec())
